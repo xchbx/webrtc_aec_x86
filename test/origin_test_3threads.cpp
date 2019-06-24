@@ -15,7 +15,7 @@
 
 #define MAX_SAMPLERATE   (16000)
 #define MAX_SAMPLES_10MS ((MAX_SAMPLERATE*10)/1000)
-#define MAX_SUBBANS_NUM  (1)
+#define MAX_SUBBANS_NUM  (3)
 #define MIC_SAMPLERATE			16000
 #define REF_SAMPLERATE			16000
 #define AEC_SAMPLERATE			16000
@@ -78,8 +78,6 @@ typedef struct
 }AecThreadParams;
 
 static void S16ToFloatS16(const short *src, size_t size, float *dest);
-static void GenarateFloatFrame(const short *src,float* const* float_frames,int frameNum);
-static void GenarateShortFrame(float* const* float_frames,short *dst,int frameNum);
 static void *micpthreadfunc(void *args);
 static void *refpthreadfunc(void *args);
 static void *aecpthreadfunc(void *args);
@@ -218,23 +216,6 @@ void S16ToFloatS16(const short *src, size_t size, float *dest)
 {
     for (size_t i = 0; i < size; ++i)
         dest[i] = (float)(src[i]);    
-}
-
-static void GenarateFloatFrame(const short *src,float* const* float_frames,int frameNum)
-{
-	for(int i = 0;i<frameNum;i++)
-	{
-		float_frames[0][i] = static_cast<float>(src[i]);
-	}
-	return;
-}
-
-static void GenarateShortFrame(float* const* float_frames,short *dst,int frameNum)
-{
-	for(int i = 1;i<frameNum;i++)
-	{
-		dst[i] = static_cast<short>(float_frames[0][i]+0.5);
-	}
 }
 
 static void *micpthreadfunc(void *args)
@@ -507,10 +488,7 @@ static void *aecpthreadfunc(void *args)
 	FILE *fref0 = NULL;
 	FILE *fref1 = NULL;
 	void *haec = NULL;
-    
-    bool  bmicresample = false;
-    bool  brefresample = false;
-    bool  baecresample = false;
+
 	bool  bmicdelayed  = false;
     bool  brefdelayed  = false;
 	int   subframesamples = 0;
@@ -563,8 +541,30 @@ static void *aecpthreadfunc(void *args)
 		*paecparams->pbfinished = true;
         return NULL;
     }
-	
+
+	StreamConfig streamcfg(paecparams->worksamplerate, 1, false);
+		
 	framesamples = (paecparams->worksamplerate*10)/1000;
+
+	pmicbuffer = new AudioBuffer(framesamples, 1, framesamples, 1, framesamples);
+    if (NULL == pmicbuffer)
+    {
+        printf("[aecpthread] new AudioBuffer(%d, %d, %d, %d, %d) for pmicbuffer failed\n",
+                framesamples, 1, framesamples, 1, framesamples);
+        goto exitproc;
+    }
+    prefbuffer = new AudioBuffer(framesamples, 1, framesamples, 1, framesamples);
+    if (NULL == prefbuffer)
+    {
+        printf("[aecpthread] new AudioBuffer(%d, %d, %d, %d, %d) for prefbuffer failed\n",
+                framesamples, 1, framesamples, 1, framesamples);
+        goto exitproc;
+    }
+     
+    numbands = pmicbuffer->num_bands();
+    subframesamples = pmicbuffer->num_frames_per_band();
+    printf("[aecpthread] frame len: %d, bands num: %d, subband frame len: %d\n",
+                framesamples, numbands, subframesamples);	
 
     haec = WebRtcAec_Create();
     if (NULL == haec)
@@ -580,17 +580,6 @@ static void *aecpthreadfunc(void *args)
         goto exitproc;
     }
 
-    if (paecparams->micframesamples != framesamples)
-    {
-		bmicresample = true;
-        pmicresampler = new PushSincResampler(paecparams->micframesamples, framesamples);
-        if (NULL == pmicresampler)
-        {
-            printf("[aecpthread] new PushSincResampler(%d, %d) for pmicresampler failed\n", paecparams->micframesamples, framesamples);
-            goto exitproc;
-        }        
-    }
-
 	faec = fopen(paecparams->sfilepath, "wb");
 	if (NULL == faec)
     {
@@ -604,19 +593,6 @@ static void *aecpthreadfunc(void *args)
 	printf("[aecpthread] dispatchcycle: %d\n", dispatchcycle);
 	gettimeofday(&time2, NULL);
 	gettimeofday(&time3, NULL);
-
-	/*
- 	while(1)
-	{
-		usleep(1000*1000);
-		printf("[aecpthread] aec pthread  TEST framesamples = %d,numbands = %d[mic:%d][ref:%d][aec:%d]\n"
-						,framesamples
-						,numbands
-						,paecparams->micframesamples
-						,paecparams->refframesamples
-						,paecparams->aecframesamples);
-	}
- */
     while(*paecparams->pbcontinue)
     {
 		float dref[MAX_SAMPLES_10MS];
@@ -626,7 +602,7 @@ static void *aecpthreadfunc(void *args)
 		gettimeofday(&time0, NULL);
 		intervaltime = difftimeval(&time0, &time3);
 		time3 = time0;
-		//printf("[aecpthread]------------------------------ 0 \n");
+
 		if (!bmicdelayed) 
 		{
 			if (paecparams->nmicdelaysamples <= WebRtc_available_read(paecparams->pmicring))
@@ -634,7 +610,6 @@ static void *aecpthreadfunc(void *args)
 				bmicdelayed = true;
 			}
 		}
-		//printf("[aecpthread]------------------------------ 1 \n");
 	    if (bmicdelayed)
 	    {
 			while (1)
@@ -651,12 +626,7 @@ static void *aecpthreadfunc(void *args)
 			{
 				fwrite(smic, sizeof(short), paecparams->micframesamples, fmic0);
 			}
-			if (bmicresample)
-			{
-				pmicresampler->Resample(smic, paecparams->micframesamples, smic, framesamples);
-			}
 	    }
-		//printf("[aecpthread]------------------------------ 2 \n");
 
 		if (!brefdelayed) 
 		{
@@ -665,7 +635,6 @@ static void *aecpthreadfunc(void *args)
 				brefdelayed = true;
 			}
 		}
-		//printf("[aecpthread]------------------------------ 3 \n");
         if (brefdelayed)
         {
 			int nGetFrameTimes = 0;
@@ -684,54 +653,63 @@ static void *aecpthreadfunc(void *args)
 				fwrite(sref, sizeof(short), paecparams->refframesamples, fref0);
 			}
         }
-		//printf("[aecpthread]------------------------------ 4 \n");
 #if 1
 		printf("[aecpthread] mic buffered:%d, ref buffered:%d, delayed:%d %d\n", 
 			WebRtc_available_read(paecparams->pmicring), 
 			WebRtc_available_read(paecparams->prefring),
 			bmicdelayed, brefdelayed);
 #endif
-		//printf("[aecpthread]------------------------------ 5 \n");
 		if (!bmicdelayed || !brefdelayed)
 		{
 			memset(smic, 0, sizeof(short)*framesamples);
 			memset(sref, 0, sizeof(short)*framesamples);
 		}
-	
-		//printf("[aecpthread]------------------------------ 6 \n");
-
-		//printf("[aecpthread]------------------------------ 7 \n");
-		std::array<float,MAX_SAMPLES_10MS> m_dframe_0;
-		std::array<float,MAX_SAMPLES_10MS> m_dframe_1;
-		std::array<float *const,2> float_frame_ptrs = {
-			&m_dframe_0[0],
-			&m_dframe_1[0],
-		};
-
-		if (fref1)
-		{
-			fwrite(sref, sizeof(short), framesamples, fref1);
-		}
-		float* const* ptr_to_float_frame = &float_frame_ptrs[0];
-		GenarateFloatFrame(sref,ptr_to_float_frame,framesamples);
-        status = WebRtcAec_BufferFarend(haec, ptr_to_float_frame[0], framesamples);
-        if (status) 
-        {
-            printf("[aecpthread] WebRtcAec_BufferFarend failed, return %d\n", status);
-        }
 
 		if (fmic1)
 		{
 			fwrite(smic, sizeof(short), framesamples, fmic1);
 		}
-		GenarateFloatFrame(smic,ptr_to_float_frame,framesamples);
-        status = WebRtcAec_Process(haec, ptr_to_float_frame, 1,ptr_to_float_frame, framesamples, 0, 0);
+		if (fref1)
+		{
+			fwrite(sref, sizeof(short), framesamples, fref1);
+		}
+
+        S16ToFloat(smic, framesamples, dmic);
+        float* const pafmic = (float* const)(&dmic[0]);
+        const float* const* ppafmic = &pafmic;
+	    pmicbuffer->CopyFrom(ppafmic, streamcfg);
+        pmicbuffer->SplitIntoFrequencyBands();
+
+        S16ToFloat(sref, framesamples, dref);
+        float* const pafref = (float* const)(&dref[0]);
+        const float* const* ppafref = &pafref;
+	    prefbuffer->CopyFrom(ppafref, streamcfg);        
+        prefbuffer->SplitIntoFrequencyBands();
+
+        status = WebRtcAec_BufferFarend(haec, prefbuffer->split_bands_const_f(0)[0], subframesamples);
+        if (status) 
+        {
+            printf("[aecpthread] WebRtcAec_BufferFarend failed, return %d\n", status);
+        }
+
+        status = WebRtcAec_Process(haec, pmicbuffer->split_bands_const_f(0), numbands, pmicbuffer->split_bands_f(0), subframesamples, 10, 0);
         if (status) 
         {
             printf("[aecpthread] WebRtcAec_Process failed, return %d\n", status);
         }
 
-		GenarateShortFrame(ptr_to_float_frame,saec,framesamples);
+        pmicbuffer->MergeFrequencyBands();
+
+        float* const  pafaec = (float* const)(&daec[0]);
+        float* const* ppafaec = &pafaec;
+	    pmicbuffer->CopyTo(streamcfg, ppafaec);
+        FloatToS16(daec, framesamples, saec);
+
+        if (baecresample)
+        {
+			paecresampler->Resample(saec, framesamples, saec, paecparams->aecframesamples);
+        }
+
         fwrite(saec, sizeof(short), paecparams->aecframesamples, faec);
 
 		gettimeofday(&time1, NULL);
@@ -754,7 +732,6 @@ static void *aecpthreadfunc(void *args)
 			usleep(sleeptime);
 		}
 		gettimeofday(&time2, NULL);
-		//printf("[aecpthread]------------------------------ 20 \n");
     }
 
 exitproc:
